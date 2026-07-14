@@ -209,6 +209,69 @@ provider:
     provider: mediatek-brom
 ```
 
+### Qualcomm EDL provider (qdl)
+
+Support for the Sahara and Firehose protocols used by Qualcomm SoCs in
+Emergency Download Mode (EDL, commonly known as "9008" mode). Devices are
+autodetected via udev by scanning for USB devices with vendor ID `0x05c6` and
+product ID `0x9008`, and are exposed as volumes.
+
+Flashing a device is a two step process. A device enters EDL speaking Sahara,
+which is only used to upload the Firehose programmer for the board (typically
+named `prog_firehose_ddr.elf`, or `xbl_s_devprg_ns.melf` on newer platforms).
+This is done by writing it to the write-only `programmer` target. Both are
+delivered as part of the board's software release rather than by boardswarm.
+
+Once the programmer is running, the device switches over to Firehose and its
+storage becomes accessible through the `lunN` targets, one per physical storage
+partition, which support read, write and seek. There is no way back to Sahara
+other than resetting the device.
+
+Firehose addresses storage by physical storage partition and sector rather than
+by partition name, and flashing a board usually starts by writing the partition
+table itself, so there isn't necessarily a partition table available to resolve
+names against. The `lunN` targets therefore give raw access to a physical
+partition, with the sector size advertised as the target blocksize. Writes have
+to start on a sector boundary.
+
+Firehose only reports storage information as part of its log output, so the
+number of physical partitions can't be detected and the size of a target isn't
+known.
+
+Committing the volume optionally marks the configured physical partition as
+bootable and then resets the device.
+
+Example configuration:
+```
+provider:
+  - name: qdl
+    provider: qdl
+    parameters:
+      match:
+        udev.ID_PATH: "pci-0000:00:14.0-usb-0:8.1"
+      # Storage type of the board: emmc, ufs, nand, nvme or spinor. Defaults to
+      # emmc
+      storage: ufs
+      # Storage sector size; defaults to the size common for the storage type
+      sector_size: 4096
+      # Number of physical storage partitions to expose as targets; defaults
+      # to one
+      luns: 6
+      # Physical storage partition holding the bootloader; if set it gets
+      # marked as bootable when the volume is committed, which ufs boards need
+      # to be able to boot at all
+      bootable_lun: 0
+      # What committing the volume makes the device do; edl (the default),
+      # system or off
+      reset_mode: edl
+      # Skip initialising the storage; needed for unprovisioned media
+      skip_storage_init: false
+```
+
+Note that the underlying qdl library always talks to the first device it finds
+in EDL mode, so only one device can be flashed at a time regardless of how many
+are connected.
+
 ### Rock USB provider (rockusb)
 
 Support for rockchip USB protocol. rockusb devices are autodetected
