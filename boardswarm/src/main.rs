@@ -38,6 +38,7 @@ mod gpio;
 mod hifive_p550_mcu;
 mod mediatek_brom;
 mod pdudaemon;
+mod qdl;
 mod registry;
 mod rockusb;
 mod serial;
@@ -1165,6 +1166,9 @@ async fn main() -> anyhow::Result<()> {
                     bail!("Mediatek brom provider requires the serial provider to be enabled")
                 }
             },
+            qdl::PROVIDER => {
+                local.spawn_local(qdl::start_provider(p.name, p.parameters, server.clone()));
+            }
             rockusb::PROVIDER => {
                 local.spawn_local(rockusb::start_provider(p.name, server.clone()));
             }
