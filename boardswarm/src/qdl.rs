@@ -9,14 +9,16 @@ use qdl::types::{
     QdlReadWrite,
 };
 use qdl::{
-    firehose_configure, firehose_get_default_sector_size, firehose_program_storage, firehose_read,
-    firehose_read_storage, firehose_reset, firehose_set_bootable, setup_target_device,
+    firehose_configure, firehose_get_default_sector_size, firehose_patch, firehose_program_storage,
+    firehose_read, firehose_read_storage, firehose_reset, firehose_set_bootable,
+    setup_target_device,
 };
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, instrument, warn};
+use xmltree::{Element, XMLNode};
 
 use crate::{
     Server, Volume, VolumeError, VolumeTarget, VolumeTargetInfo, registry,
@@ -32,11 +34,22 @@ pub const PROVIDER: &str = "qdl";
 /// the Firehose protocol and this target can no longer be used.
 pub const TARGET_PROGRAMMER: &str = "programmer";
 
+/// Target to apply firehose patches to the storage through.
+///
+/// Patch operations refer to values only the device can work out, like the size
+/// of its storage or a checksum over part of it. They carry no data of their
+/// own, so rather then expressing them through the lun targets, a patch file is
+/// written here and the operations in it are handed to the device as they are.
+pub const TARGET_PATCH: &str = "patch";
+
 const USB_VID_QCOM: u64 = 0x05c6;
 const USB_PID_EDL: u64 = 0x9008;
 
 /// Maximum size accepted for a programmer image
 const PROGRAMMER_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+/// Maximum size accepted for a patch file
+const PATCH_MAX_SIZE: usize = 1024 * 1024;
 
 fn default_luns() -> u8 {
     1
@@ -154,9 +167,85 @@ struct SessionParameters {
     bootable_lun: Option<u8>,
 }
 
+/// A `<patch>` operation from a patch file
+#[derive(Debug)]
+struct PatchEntry {
+    lun: u8,
+    start_sector: String,
+    byte_offset: u64,
+    size_in_bytes: u64,
+    value: String,
+    what: String,
+}
+
+fn attr<'a>(e: &'a Element, name: &str) -> anyhow::Result<&'a str> {
+    e.attributes
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!("<{}> without a {name} attribute", e.name))
+}
+
+fn attr_parse<T>(e: &Element, name: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let v = attr(e, name)?;
+    v.parse()
+        .map_err(|err| anyhow::anyhow!("<{}> has an invalid {name} of {v:?}: {err}", e.name))
+}
+
+/// Pick the operations out of a patch file that apply to the device
+///
+/// The start_sector and value of an operation are handed to the device as they
+/// are: they're expressions it evaluates itself, referring to things like the
+/// size of its storage or a checksum over part of it.
+fn parse_patches(data: &[u8], sector_size: usize) -> anyhow::Result<Vec<PatchEntry>> {
+    let xml = Element::parse(data)?;
+    let mut entries = Vec::new();
+
+    for node in &xml.children {
+        let XMLNode::Element(e) = node else { continue };
+        if !e.name.eq_ignore_ascii_case("patch") {
+            continue;
+        }
+        // Patches against a file rather then the storage are meant for the host
+        // that built the images and are of no use here; qdl-rs skips these too
+        if attr(e, "filename")? != "DISK" {
+            continue;
+        }
+
+        let s: usize = attr_parse(e, "SECTOR_SIZE_IN_BYTES")?;
+        if s != sector_size {
+            anyhow::bail!(
+                "<patch> uses a sector size of {s} bytes but the volume is configured for {sector_size}"
+            );
+        }
+        let slot: u8 = match e.attributes.get("slot") {
+            Some(s) => s.parse()?,
+            None => 0,
+        };
+        if slot != 0 {
+            anyhow::bail!("<patch> for slot {slot}, only slot 0 is supported");
+        }
+
+        entries.push(PatchEntry {
+            lun: attr_parse(e, "physical_partition_number")?,
+            start_sector: attr(e, "start_sector")?.to_string(),
+            byte_offset: attr_parse(e, "byte_offset")?,
+            size_in_bytes: attr_parse(e, "size_in_bytes")?,
+            value: attr(e, "value")?.to_string(),
+            what: attr(e, "what").unwrap_or("").to_string(),
+        });
+    }
+
+    Ok(entries)
+}
+
 #[derive(Debug)]
 enum QdlCommand {
     SendProgrammer(Bytes, oneshot::Sender<Result<(), QdlError>>),
+    Patch(Bytes, oneshot::Sender<Result<(), QdlError>>),
     Program {
         lun: u8,
         start_sector: u64,
@@ -325,6 +414,32 @@ impl Session {
         Ok(buf.into())
     }
 
+    /// Apply the operations in a patch file to the storage
+    fn patch(&mut self, data: Bytes) -> Result<(), QdlError> {
+        self.require_firehose()?;
+
+        let entries = parse_patches(&data, self.parameters.sector_size)
+            .map_err(|e| QdlError::Failure(e.to_string()))?;
+        let device = self.device()?;
+
+        for e in &entries {
+            info!("Patching lun{}: {}", e.lun, e.what);
+            firehose_patch(
+                device,
+                e.byte_offset,
+                0,
+                e.lun,
+                e.size_in_bytes,
+                &e.start_sector,
+                &e.value,
+            )
+            .map_err(|err| QdlError::Failure(format!("Patch {:?} failed: {err}", e.what)))?;
+        }
+
+        info!("Applied {} patches", entries.len());
+        Ok(())
+    }
+
     /// Finish the session off by resetting the device
     fn commit(&mut self) -> Result<(), QdlError> {
         self.require_firehose()?;
@@ -362,6 +477,9 @@ fn qdl_session(parameters: SessionParameters, mut commands: mpsc::Receiver<QdlCo
         match command {
             QdlCommand::SendProgrammer(data, tx) => {
                 let _ = tx.send(session.send_programmer(data));
+            }
+            QdlCommand::Patch(data, tx) => {
+                let _ = tx.send(session.patch(data));
             }
             QdlCommand::Program {
                 lun,
@@ -429,14 +547,24 @@ impl QdlVolume {
         let luns = parameters.luns;
         std::thread::spawn(move || qdl_session(parameters, rx));
 
-        let mut targets = vec![VolumeTargetInfo {
-            name: TARGET_PROGRAMMER.to_string(),
-            readable: false,
-            writable: true,
-            seekable: false,
-            size: None,
-            blocksize: None,
-        }];
+        let mut targets = vec![
+            VolumeTargetInfo {
+                name: TARGET_PROGRAMMER.to_string(),
+                readable: false,
+                writable: true,
+                seekable: false,
+                size: None,
+                blocksize: None,
+            },
+            VolumeTargetInfo {
+                name: TARGET_PATCH.to_string(),
+                readable: false,
+                writable: true,
+                seekable: false,
+                size: None,
+                blocksize: None,
+            },
+        ];
         targets.extend(
             (0..luns).map(|lun| lun_target(lun, sector_size, lun_sizes.get(lun as usize).copied())),
         );
@@ -465,7 +593,19 @@ impl Volume for QdlVolume {
         };
 
         let t: Box<dyn VolumeTarget> = if target == TARGET_PROGRAMMER {
-            Box::new(ProgrammerTarget::new(self.commands.clone(), length))
+            Box::new(BufferedTarget::new(
+                self.commands.clone(),
+                length,
+                PROGRAMMER_MAX_SIZE,
+                QdlCommand::SendProgrammer,
+            ))
+        } else if target == TARGET_PATCH {
+            Box::new(BufferedTarget::new(
+                self.commands.clone(),
+                length,
+                PATCH_MAX_SIZE,
+                QdlCommand::Patch,
+            ))
         } else {
             let lun = lun_from_target_name(target).ok_or(VolumeError::UnknownTargetRequested)?;
             Box::new(LunTarget {
@@ -489,25 +629,36 @@ impl Volume for QdlVolume {
     }
 }
 
-struct ProgrammerTarget {
+/// Target that collects everything written to it and hands it to the session as
+/// one command on shutdown
+struct BufferedTarget {
     commands: mpsc::Sender<QdlCommand>,
     data: BytesMut,
+    max: usize,
+    command: fn(Bytes, oneshot::Sender<Result<(), QdlError>>) -> QdlCommand,
 }
 
-impl ProgrammerTarget {
-    fn new(commands: mpsc::Sender<QdlCommand>, size_hint: Option<u64>) -> Self {
-        let data = BytesMut::with_capacity(
-            size_hint
-                .unwrap_or(1024 * 1024)
-                .min(PROGRAMMER_MAX_SIZE as u64) as usize,
-        );
-        Self { commands, data }
+impl BufferedTarget {
+    fn new(
+        commands: mpsc::Sender<QdlCommand>,
+        size_hint: Option<u64>,
+        max: usize,
+        command: fn(Bytes, oneshot::Sender<Result<(), QdlError>>) -> QdlCommand,
+    ) -> Self {
+        let data =
+            BytesMut::with_capacity(size_hint.unwrap_or(1024 * 1024).min(max as u64) as usize);
+        Self {
+            commands,
+            data,
+            max,
+            command,
+        }
     }
 
     async fn shutdown(&mut self) -> Result<(), QdlError> {
         let (tx, rx) = oneshot::channel();
         self.commands
-            .send(QdlCommand::SendProgrammer(self.data.split().into(), tx))
+            .send((self.command)(self.data.split().into(), tx))
             .await
             .map_err(|_e| QdlError::SessionGone)?;
         rx.await.map_err(QdlError::NoResponse)?
@@ -515,12 +666,12 @@ impl ProgrammerTarget {
 }
 
 #[async_trait::async_trait]
-impl VolumeTarget for ProgrammerTarget {
+impl VolumeTarget for BufferedTarget {
     async fn write(&mut self, data: Bytes, offset: u64, completion: crate::WriteCompletion) {
         if offset as usize != self.data.len() {
             completion.complete(Err(tonic::Status::out_of_range("Invalid offset")));
-        } else if data.len() + self.data.len() > PROGRAMMER_MAX_SIZE {
-            completion.complete(Err(tonic::Status::out_of_range("Programmer too big")));
+        } else if data.len() + self.data.len() > self.max {
+            completion.complete(Err(tonic::Status::out_of_range("Too much data for target")));
         } else {
             self.data.extend_from_slice(&data);
             completion.complete(Ok(data.len() as u64));
@@ -743,5 +894,42 @@ pub async fn start_provider(name: String, parameters: Option<serde_yaml::Value>,
             }
             DeviceEvent::Remove(device) => registrations.remove(&device),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::parse_patches;
+
+    const PATCHFILE: &[u8] = br#"<?xml version="1.0" ?>
+<patches>
+  <patch SECTOR_SIZE_IN_BYTES="4096" byte_offset="24" filename="DISK" physical_partition_number="0" size_in_bytes="4" start_sector="1" value="NUM_DISK_SECTORS-1." what="Update Backup Header Location"/>
+  <patch SECTOR_SIZE_IN_BYTES="4096" byte_offset="88" filename="DISK" physical_partition_number="2" size_in_bytes="4" start_sector="1" value="CRC32(2,16384)" what="Update Partition Entry Array CRC"/>
+  <patch SECTOR_SIZE_IN_BYTES="4096" byte_offset="0" filename="rawprogram0.xml" physical_partition_number="0" size_in_bytes="4" start_sector="0" value="12345" what="Host side patch"/>
+</patches>"#;
+
+    #[test]
+    fn parses_patches_for_the_device() {
+        let patches = parse_patches(PATCHFILE, 4096).unwrap();
+        // The patch against rawprogram0.xml is for the host that built the
+        // images, not for the device
+        assert_eq!(patches.len(), 2);
+
+        assert_eq!(patches[0].lun, 0);
+        assert_eq!(patches[0].byte_offset, 24);
+        assert_eq!(patches[0].size_in_bytes, 4);
+        // Expressions are handed to the device untouched
+        assert_eq!(patches[0].start_sector, "1");
+        assert_eq!(patches[0].value, "NUM_DISK_SECTORS-1.");
+
+        assert_eq!(patches[1].lun, 2);
+        assert_eq!(patches[1].value, "CRC32(2,16384)");
+    }
+
+    #[test]
+    fn rejects_a_mismatched_sector_size() {
+        // Applying these against the wrong sector size would patch the wrong
+        // place entirely
+        assert!(parse_patches(PATCHFILE, 512).is_err());
     }
 }

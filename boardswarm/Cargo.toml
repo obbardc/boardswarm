@@ -47,6 +47,7 @@ strum_macros = "0.28.0"
 regex = "1.11.1"
 proc-mounts = "0.3.0"
 rustls = { version = "0.23.37", features = ["aws-lc-rs"] }
+xmltree = "0.11"
 # qdlrs is not published on crates.io yet; pin to a git revision until it is released
 # tracked under https://github.com/qualcomm/qdlrs/issues/10
 qdl = { git = "https://github.com/qualcomm/qdlrs", rev = "394e341f90a90fa4aa6f24f59bcd6083987c47fd", features = ["usb"] }

@@ -392,6 +392,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "xmltree",
 ]
 
 [[package]]
