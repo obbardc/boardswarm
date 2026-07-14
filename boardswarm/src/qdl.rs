@@ -4,10 +4,13 @@ use std::str::FromStr;
 use bytes::{Bytes, BytesMut};
 use qdl::parsers::{firehose_parser_ack_nak, firehose_parser_configure_response};
 use qdl::sahara::{SaharaMode, sahara_run};
-use qdl::types::{FirehoseConfiguration, FirehoseStorageType, QdlBackend, QdlDevice, QdlReadWrite};
+use qdl::types::{
+    FirehoseConfiguration, FirehoseResetMode, FirehoseStorageType, QdlBackend, QdlDevice,
+    QdlReadWrite,
+};
 use qdl::{
     firehose_configure, firehose_get_default_sector_size, firehose_program_storage, firehose_read,
-    firehose_read_storage, setup_target_device,
+    firehose_read_storage, firehose_reset, firehose_set_bootable, setup_target_device,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -39,6 +42,32 @@ fn default_luns() -> u8 {
     1
 }
 
+/// What a device should do when a volume gets committed
+///
+/// [FirehoseResetMode] can't be used directly as it isn't copyable and doesn't
+/// deserialize.
+#[derive(Deserialize, Debug, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+enum ResetMode {
+    /// Reboot back into EDL, leaving the device ready for another flash
+    #[default]
+    Edl,
+    /// Reboot into the system that was just flashed
+    System,
+    /// Power the device off
+    Off,
+}
+
+impl From<ResetMode> for FirehoseResetMode {
+    fn from(mode: ResetMode) -> Self {
+        match mode {
+            ResetMode::Edl => FirehoseResetMode::ResetToEdl,
+            ResetMode::System => FirehoseResetMode::Reset,
+            ResetMode::Off => FirehoseResetMode::Off,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct QdlParameters {
     #[serde(rename = "match")]
@@ -55,6 +84,12 @@ struct QdlParameters {
     /// Skip initialising the storage; required for unprovisioned media
     #[serde(default)]
     skip_storage_init: bool,
+    /// What committing the volume should make the device do
+    #[serde(default)]
+    reset_mode: ResetMode,
+    /// Physical storage partition holding the bootloader, marked as bootable
+    /// when the volume gets committed
+    bootable_lun: Option<u8>,
 }
 
 impl Default for QdlParameters {
@@ -65,6 +100,8 @@ impl Default for QdlParameters {
             sector_size: None,
             luns: default_luns(),
             skip_storage_init: false,
+            reset_mode: ResetMode::default(),
+            bootable_lun: None,
         }
     }
 }
@@ -103,6 +140,8 @@ struct SessionParameters {
     sector_size: usize,
     luns: u8,
     skip_storage_init: bool,
+    reset_mode: ResetMode,
+    bootable_lun: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -120,6 +159,7 @@ enum QdlCommand {
         num_sectors: usize,
         tx: oneshot::Sender<Result<Bytes, QdlError>>,
     },
+    Commit(oneshot::Sender<Result<(), QdlError>>),
 }
 
 fn open_device(
@@ -274,6 +314,31 @@ impl Session {
 
         Ok(buf.into())
     }
+
+    /// Finish the session off by resetting the device
+    fn commit(&mut self) -> Result<(), QdlError> {
+        self.require_firehose()?;
+
+        let bootable_lun = self.parameters.bootable_lun;
+        let mode = FirehoseResetMode::from(self.parameters.reset_mode);
+        let device = self.device()?;
+
+        if let Some(lun) = bootable_lun {
+            info!("Marking lun{lun} as bootable");
+            firehose_set_bootable(device, lun).map_err(|e| QdlError::Failure(e.to_string()))?;
+        }
+
+        info!("Resetting device to {mode}");
+        let r = firehose_reset(device, &mode, 0).map_err(|e| QdlError::Failure(e.to_string()));
+
+        // The device is on its way out regardless of how the reset went, so drop
+        // the connection to it. It'll come back as a new volume through udev if
+        // it re-enters EDL.
+        self.device = None;
+        self.firehose = false;
+
+        r
+    }
 }
 
 /// Blocking task owning the connection to a device
@@ -303,6 +368,9 @@ fn qdl_session(parameters: SessionParameters, mut commands: mpsc::Receiver<QdlCo
                 tx,
             } => {
                 let _ = tx.send(session.read(lun, start_sector, num_sectors));
+            }
+            QdlCommand::Commit(tx) => {
+                let _ = tx.send(session.commit());
             }
         }
     }
@@ -399,6 +467,12 @@ impl Volume for QdlVolume {
     }
 
     async fn commit(&self) -> Result<(), VolumeError> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(QdlCommand::Commit(tx))
+            .await
+            .map_err(|_e| QdlError::SessionGone)?;
+        rx.await.map_err(QdlError::NoResponse)??;
         Ok(())
     }
 }
@@ -570,11 +644,23 @@ pub async fn start_provider(name: String, parameters: Option<serde_yaml::Value>,
         return;
     }
 
+    if let Some(lun) = parameters.bootable_lun
+        && lun >= parameters.luns
+    {
+        warn!(
+            "qdl bootable_lun {lun} is outside of the {} configured luns",
+            parameters.luns
+        );
+        return;
+    }
+
     let session = SessionParameters {
         storage,
         sector_size,
         luns: parameters.luns,
         skip_storage_init: parameters.skip_storage_init,
+        reset_mode: parameters.reset_mode,
+        bootable_lun: parameters.bootable_lun,
     };
 
     let registrations = DeviceRegistrations::new(server);
