@@ -81,6 +81,15 @@ struct QdlParameters {
     /// have several luns, other storage types only have one
     #[serde(default = "default_luns")]
     luns: u8,
+    /// Size of each physical storage partition in bytes, in lun order
+    ///
+    /// Clients need this to work out where the end of a lun is, which is where
+    /// a backup partition table goes.
+    // TODO: the <getstorageinfo> response carries this, but qdl only prints it
+    // to the firehose log and drops it. Parsing it upstream would make this
+    // configuration unnecessary and remove the risk of it being wrong.
+    #[serde(default)]
+    lun_sizes: Vec<u64>,
     /// Skip initialising the storage; required for unprovisioned media
     #[serde(default)]
     skip_storage_init: bool,
@@ -99,6 +108,7 @@ impl Default for QdlParameters {
             storage: None,
             sector_size: None,
             luns: default_luns(),
+            lun_sizes: Vec::new(),
             skip_storage_init: false,
             reset_mode: ResetMode::default(),
             bootable_lun: None,
@@ -392,15 +402,15 @@ fn lun_from_target_name(target: &str) -> Option<u8> {
     target.strip_prefix(LUN_TARGET_PREFIX)?.parse().ok()
 }
 
-fn lun_target(lun: u8, sector_size: usize) -> VolumeTargetInfo {
+fn lun_target(lun: u8, sector_size: usize, size: Option<u64>) -> VolumeTargetInfo {
     VolumeTargetInfo {
         name: lun_target_name(lun),
         readable: true,
         writable: true,
         seekable: true,
         // Firehose can only report storage information through its log output,
-        // so the size of a physical partition isn't available
-        size: None,
+        // so this is only known if it was configured
+        size,
         blocksize: Some(sector_size as u32),
     }
 }
@@ -413,7 +423,7 @@ struct QdlVolume {
 }
 
 impl QdlVolume {
-    fn new(parameters: SessionParameters) -> Self {
+    fn new(parameters: SessionParameters, lun_sizes: &[u64]) -> Self {
         let (commands, rx) = mpsc::channel(1);
         let sector_size = parameters.sector_size;
         let luns = parameters.luns;
@@ -427,7 +437,9 @@ impl QdlVolume {
             size: None,
             blocksize: None,
         }];
-        targets.extend((0..luns).map(|lun| lun_target(lun, sector_size)));
+        targets.extend(
+            (0..luns).map(|lun| lun_target(lun, sector_size, lun_sizes.get(lun as usize).copied())),
+        );
 
         Self {
             commands,
@@ -654,6 +666,30 @@ pub async fn start_provider(name: String, parameters: Option<serde_yaml::Value>,
         return;
     }
 
+    // A wrong lun size puts a backup partition table in the wrong place, which
+    // isn't something a client can notice, so be strict about it here
+    if !parameters.lun_sizes.is_empty() {
+        if parameters.lun_sizes.len() != parameters.luns as usize {
+            warn!(
+                "qdl lun_sizes has {} entries but {} luns are configured",
+                parameters.lun_sizes.len(),
+                parameters.luns
+            );
+            return;
+        }
+        if let Some((lun, size)) = parameters
+            .lun_sizes
+            .iter()
+            .enumerate()
+            .find(|(_, size)| **size == 0 || !size.is_multiple_of(sector_size as u64))
+        {
+            warn!(
+                "qdl lun{lun} size {size} is not a non-zero multiple of the {sector_size} byte sector size"
+            );
+            return;
+        }
+    }
+
     let session = SessionParameters {
         storage,
         sector_size,
@@ -703,7 +739,7 @@ pub async fn start_provider(name: String, parameters: Option<serde_yaml::Value>,
                 // registering: the Sahara handshake can only be done once and
                 // reading it here would break the following programmer upload.
                 let prereg = registrations.pre_register(&device, seqnum);
-                prereg.register_volume(properties, QdlVolume::new(session));
+                prereg.register_volume(properties, QdlVolume::new(session, &parameters.lun_sizes));
             }
             DeviceEvent::Remove(device) => registrations.remove(&device),
         }

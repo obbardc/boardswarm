@@ -234,9 +234,10 @@ names against. The `lunN` targets therefore give raw access to a physical
 partition, with the sector size advertised as the target blocksize. Writes have
 to start on a sector boundary.
 
-Firehose only reports storage information as part of its log output, so the
-number of physical partitions can't be detected and the size of a target isn't
-known.
+Firehose only reports storage information as part of its log output, so neither
+the number of physical storage partitions nor their sizes can be detected; both
+have to be configured. Sizes are optional, but clients need them to work out
+where the end of a partition is, which is where a backup partition table goes.
 
 Committing the volume optionally marks the configured physical partition as
 bootable and then resets the device.
@@ -257,6 +258,16 @@ provider:
       # Number of physical storage partitions to expose as targets; defaults
       # to one
       luns: 6
+      # Size of each lun in bytes, in lun order. Optional, but needed by clients
+      # to place a backup partition table. A wrong value here silently puts one
+      # in the wrong place
+      lun_sizes:
+        - 8589934592
+        - 8388608
+        - 8388608
+        - 33554432
+        - 268435456
+        - 4294967296
       # Physical storage partition holding the bootloader; if set it gets
       # marked as bootable when the volume is committed, which ufs boards need
       # to be able to boot at all
