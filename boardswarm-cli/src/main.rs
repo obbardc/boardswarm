@@ -36,6 +36,7 @@ use tracing::{debug, info};
 use ui::TerminalSizeSetting;
 use utils::BatchWriter;
 
+mod qdl;
 mod ui;
 mod ui_term;
 mod utils;
@@ -659,6 +660,24 @@ enum DeviceCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum QdlCommand {
+    /// Flash a device in EDL mode from rawprogram and patch files
+    Flash {
+        #[clap(flatten)]
+        volume: DeviceCommonVolumeArgs,
+        /// rawprogram xml files to flash
+        #[arg(short = 'p', long = "program", required = true)]
+        programs: Vec<PathBuf>,
+        /// patch xml files to apply after flashing
+        #[arg(short = 'x', long = "patch")]
+        patches: Vec<PathBuf>,
+        /// Commit the volume when done, resetting the device
+        #[arg(short, long)]
+        commit: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RockCommand {
     /// Transfer a combined boot file containing images of type 0x471 and 0x472 to a rock device
     DownloadBoot {
@@ -710,6 +729,14 @@ enum Command {
         device: DeviceArg,
         #[command(subcommand)]
         command: DeviceCommand,
+    },
+    /// Commands specific to Qualcomm devices in EDL mode
+    Qdl {
+        #[arg(value_parser = parse_device)]
+        /// The device to use
+        device: DeviceArg,
+        #[command(subcommand)]
+        command: QdlCommand,
     },
     /// Commands specific to rockchip devices
     Rock {
@@ -1412,6 +1439,27 @@ async fn main() -> anyhow::Result<()> {
                     let properties = boardswarm.properties(ItemType::Device, device.id()).await?;
                     for key in properties.keys().sorted_unstable() {
                         println!(r#""{}" => "{}""#, key, properties[key]);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Qdl { device, command } => {
+            let device = device
+                .device(boardswarm)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Device not found"))?;
+            match command {
+                QdlCommand::Flash {
+                    volume,
+                    programs,
+                    patches,
+                    commit,
+                } => {
+                    let mut volume = volume.open(&device).await?;
+                    qdl::flash(&mut volume, &programs, &patches).await?;
+                    if commit {
+                        volume.commit().await?;
                     }
                 }
             }

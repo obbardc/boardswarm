@@ -427,6 +427,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "vt100",
+ "xmltree",
 ]
 
 [[package]]
