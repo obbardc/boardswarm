@@ -23,18 +23,6 @@ struct Program {
     file_sector_offset: u64,
 }
 
-/// A `<patch>` entry from a patch file
-#[derive(Debug)]
-struct Patch {
-    lun: u8,
-    sector_size: u64,
-    start_sector: String,
-    byte_offset: u64,
-    size_in_bytes: u64,
-    value: String,
-    what: String,
-}
-
 fn attr<'a>(e: &'a Element, name: &str) -> anyhow::Result<&'a str> {
     e.attributes
         .get(name)
@@ -100,38 +88,13 @@ fn programs_from_xml(xml: &Element) -> anyhow::Result<Vec<Program>> {
         .collect()
 }
 
-fn parse_patches(path: &Path) -> anyhow::Result<Vec<Patch>> {
-    patches_from_xml(&parse_file(path)?)
-}
-
-fn patches_from_xml(xml: &Element) -> anyhow::Result<Vec<Patch>> {
-    elements(xml, "patch")
-        .filter(|e| {
-            // Patches against anything but the device storage are meant for the
-            // files on the host that built the images, and are of no use here.
-            // qdl-rs skips these in the same way.
-            attr(e, "filename").map(|f| f == "DISK").unwrap_or(false)
-        })
-        .map(|e| {
-            Ok(Patch {
-                lun: attr_parse(e, "physical_partition_number")?,
-                sector_size: attr_parse(e, "SECTOR_SIZE_IN_BYTES")?,
-                start_sector: attr(e, "start_sector")?.to_string(),
-                byte_offset: attr_parse(e, "byte_offset")?,
-                size_in_bytes: attr_parse(e, "size_in_bytes")?,
-                value: attr(e, "value")?.to_string(),
-                what: attr(e, "what").unwrap_or("").to_string(),
-            })
-        })
-        .collect()
-}
-
-/// Resolve a sector expression from a rawprogram or patch file
+/// Resolve a sector expression from a rawprogram file
 ///
 /// These are either a plain number or an offset from the end of the storage,
 /// spelled as `NUM_DISK_SECTORS-33.` with a trailing dot. Firehose has the
-/// device evaluate these, but driving it through volume targets means they have
-/// to be resolved here, which needs the size of the storage.
+/// device evaluate these, but a program entry carries data that only the client
+/// has, so it has to go through a lun target and be resolved here, which needs
+/// the size of the storage.
 fn eval_sectors(expr: &str, num_disk_sectors: Option<u64>) -> anyhow::Result<u64> {
     let e = expr.trim().trim_end_matches('.').trim();
     if let Ok(v) = e.parse::<u64>() {
@@ -229,47 +192,25 @@ async fn write_program(volume: &mut DeviceVolume, dir: &Path, p: &Program) -> an
     Ok(())
 }
 
-async fn apply_patch(volume: &mut DeviceVolume, p: &Patch) -> anyhow::Result<()> {
-    if p.size_in_bytes == 0 || p.size_in_bytes > 8 {
-        bail!("<patch> of {} bytes is not supported", p.size_in_bytes);
-    }
+/// Hand a patch file to the device
+///
+/// Patch operations don't carry any data of their own; their values are
+/// expressions the device evaluates against its own storage. The whole file is
+/// handed to the qdl provider, which turns each operation in it into a firehose
+/// patch.
+async fn apply_patches(volume: &mut DeviceVolume, path: &Path) -> anyhow::Result<()> {
+    let data = std::fs::read(path).with_context(|| format!("Reading {}", path.display()))?;
 
-    let target = format!("lun{}", p.lun);
     let mut io = volume
-        .open(&target, None)
+        .open("patch", Some(data.len() as u64))
         .await
-        .with_context(|| format!("Opening {target}"))?;
-    let num_disk_sectors = check_target(&target, &io, p.sector_size)?;
-
-    let start = eval_sectors(&p.start_sector, num_disk_sectors)?;
-    let value = eval_sectors(&p.value, num_disk_sectors)
-        .with_context(|| format!("Resolving the value to patch in for {:?}", p.what))?;
-
-    // Firehose patches in place; through a volume target the sector holding the
-    // value has to be read, modified and written back
-    let at = start * p.sector_size + p.byte_offset;
-    let sector = at / p.sector_size;
-    let in_sector = (at % p.sector_size) as usize;
-    let size = p.size_in_bytes as usize;
-    if in_sector + size > p.sector_size as usize {
-        bail!("<patch> for {:?} straddles a sector boundary", p.what);
-    }
-
-    io.seek(SeekFrom::Start(sector * p.sector_size)).await?;
-    let mut buf = vec![0u8; p.sector_size as usize];
-    io.read_exact(&mut buf)
+        .context("Opening the patch target")?;
+    io.write_all(&data).await?;
+    io.shutdown()
         .await
-        .with_context(|| format!("Reading {target} sector {sector}"))?;
+        .with_context(|| format!("Applying {}", path.display()))?;
 
-    buf[in_sector..in_sector + size].copy_from_slice(&value.to_le_bytes()[..size]);
-
-    io.seek(SeekFrom::Start(sector * p.sector_size)).await?;
-    io.write_all(&buf)
-        .await
-        .with_context(|| format!("Writing {target} sector {sector}"))?;
-    io.shutdown().await.context("Volume shutdown")?;
-
-    println!("Patched {target} sector {sector}: {}", p.what);
+    println!("Applied {}", path.display());
     Ok(())
 }
 
@@ -304,20 +245,20 @@ pub async fn flash(
         }
     }
 
-    let mut to_patch = Vec::new();
-    for path in patches {
-        to_patch.extend(parse_patches(path)?);
+    if let Some(missing) = patches.iter().find(|p| !p.exists()) {
+        bail!("{} doesn't exist", missing.display());
     }
 
-    if to_program.is_empty() && to_patch.is_empty() {
+    if to_program.is_empty() && patches.is_empty() {
         bail!("Nothing to flash");
     }
 
     for (dir, p) in &to_program {
         write_program(volume, dir, p).await?;
     }
-    for p in &to_patch {
-        apply_patch(volume, p).await?;
+    // Patches fix up what was just written, so they go last
+    for path in patches {
+        apply_patches(volume, path).await?;
     }
 
     Ok(())
@@ -325,7 +266,7 @@ pub async fn flash(
 
 #[cfg(test)]
 mod test {
-    use super::{eval_sectors, patches_from_xml, programs_from_xml};
+    use super::{eval_sectors, programs_from_xml};
     use xmltree::Element;
 
     const RAWPROGRAM: &str = r#"<?xml version="1.0" ?>
@@ -335,12 +276,6 @@ mod test {
   <program SECTOR_SIZE_IN_BYTES="4096" file_sector_offset="0" filename="" label="empty" num_partition_sectors="0" physical_partition_number="0" size_in_KB="0.0" sparse="false" start_byte_hex="0x0" start_sector="100"/>
   <program SECTOR_SIZE_IN_BYTES="4096" file_sector_offset="0" filename="gpt_backup0.bin" label="BackupGPT" num_partition_sectors="5" physical_partition_number="0" size_in_KB="20.0" sparse="false" start_byte_hex="0x0" start_sector="NUM_DISK_SECTORS-5."/>
 </data>"#;
-
-    const PATCHFILE: &str = r#"<?xml version="1.0" ?>
-<patches>
-  <patch SECTOR_SIZE_IN_BYTES="4096" byte_offset="24" filename="DISK" physical_partition_number="0" size_in_bytes="4" start_sector="1" value="NUM_DISK_SECTORS-1." what="Update Backup Header Location"/>
-  <patch SECTOR_SIZE_IN_BYTES="4096" byte_offset="0" filename="rawprogram0.xml" physical_partition_number="0" size_in_bytes="4" start_sector="0" value="12345" what="Host side patch"/>
-</patches>"#;
 
     #[test]
     fn parses_rawprogram_entries() {
@@ -366,16 +301,6 @@ mod test {
 
         // The backup table is placed relative to the end of the storage
         assert_eq!(programs[3].start_sector, "NUM_DISK_SECTORS-5.");
-    }
-
-    #[test]
-    fn skips_host_side_patches() {
-        let patches = patches_from_xml(&Element::parse(PATCHFILE.as_bytes()).unwrap()).unwrap();
-        // Only the DISK patch applies to the device
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].byte_offset, 24);
-        assert_eq!(patches[0].size_in_bytes, 4);
-        assert_eq!(patches[0].value, "NUM_DISK_SECTORS-1.");
     }
 
     #[test]
