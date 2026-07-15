@@ -239,10 +239,18 @@ the number of physical storage partitions nor their sizes can be detected; both
 have to be configured. Sizes are optional, but clients need them to work out
 where the end of a partition is, which is where a backup partition table goes.
 
+Patch files are written to the `patch` target instead. The operations in them
+refer to values only the device can work out, such as the size of its storage
+(`NUM_DISK_SECTORS-33.`) or a checksum over part of it (`CRC32(2,16384)`), so
+rather than resolving those, the file is handed over as-is and each operation in
+it is passed to the device to evaluate. Unlike the entries in a rawprogram file,
+patch operations carry no data of their own, so nothing from the client is
+needed to apply them.
+
 Committing the volume optionally marks the configured physical partition as
 bootable and then resets the device.
 
-The boardswarm cli can drive both steps. Since the images live on the client
+The boardswarm cli can drive all of this. Since the images live on the client
 rather than on the server, it parses the rawprogram files itself and turns each
 entry into writes to the `lunN` targets:
 
@@ -250,10 +258,6 @@ entry into writes to the `lunN` targets:
 $ boardswarm-cli device <device> write qdl programmer prog_firehose_ddr.elf
 $ boardswarm-cli qdl <device> flash --commit qdl -p rawprogram0.xml -x patch0.xml
 ```
-
-Note that patch files typically contain values that ask the device to checksum
-its own storage (spelled `CRC32(...)`), which can't be expressed through a
-volume target; the cli rejects those rather than guessing at them.
 
 Example configuration:
 ```
